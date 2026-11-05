@@ -1,0 +1,21 @@
+# Keeps pinned dependencies current: Go modules, GitHub Actions (pinned by
+# commit SHA in workflows) and Docker base images (pinned by digest).
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule: { interval: weekly }
+    groups:
+      go-minor-and-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: weekly }
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: docker
+    directory: /
+    schedule: { interval: weekly }

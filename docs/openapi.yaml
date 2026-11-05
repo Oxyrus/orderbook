@@ -1,0 +1,568 @@
+openapi: 3.1.0
+info:
+  title: Orderbook API
+  version: 1.0.0
+  description: |
+    Multi-tenant order management. Data is sharded by tenant with Citus;
+    order events are published to Kafka through a transactional outbox and
+    Debezium.
+
+    All `/v1` endpoints require an OAuth 2.0 bearer access token (JWT) issued
+    by the configured authorization server. Tenant-scoped endpoints act on
+    the tenant named by the token's `tenant_id` claim (configurable with
+    `TENANT_CLAIM`); tokens without a valid tenant get 403 `tenant_required`
+    / `tenant_invalid`. Resources of other tenants are reported as not found.
+    Errors use RFC 9457 `application/problem+json`.
+servers:
+  - url: http://localhost:8080
+    description: Local development
+
+security:
+  - oauth2: []
+
+tags:
+  - name: catalog
+  - name: orders
+  - name: sales
+  - name: platform
+    description: Cross-tenant endpoints for operators (`platform:read`).
+  - name: system
+
+paths:
+  /livez:
+    get:
+      tags: [system]
+      summary: Liveness probe
+      security: []
+      responses:
+        "200":
+          description: Process is alive
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Health" }
+
+  /readyz:
+    get:
+      tags: [system]
+      summary: Readiness probe (checks dependencies)
+      security: []
+      responses:
+        "200":
+          description: Ready to serve traffic
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Health" }
+        "503":
+          description: A dependency is unhealthy, or the instance is draining
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Health" }
+
+  /v1/me:
+    get:
+      tags: [system]
+      summary: Return the authenticated principal
+      responses:
+        "200":
+          description: The caller identity extracted from the token
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sub: { type: string }
+                  client_id: { type: string }
+                  tenant: { type: string, description: Empty for platform tokens }
+                  scopes: { type: array, items: { type: string } }
+                  expires_at: { type: string, format: date-time }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/products:
+    get:
+      tags: [catalog]
+      summary: List the tenant's products, newest first
+      security: [{ oauth2: [catalog:read] }]
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: A page of products
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ProductList" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+    post:
+      tags: [catalog]
+      summary: Create a product
+      security: [{ oauth2: [catalog:write] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/WriteProduct" }
+      responses:
+        "201":
+          description: Created
+          headers:
+            Location: { schema: { type: string } }
+            ETag: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Product" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+
+  /v1/products/{id}:
+    parameters:
+      - $ref: "#/components/parameters/ID"
+    get:
+      tags: [catalog]
+      summary: Get a product
+      security: [{ oauth2: [catalog:read] }]
+      parameters:
+        - $ref: "#/components/parameters/IfNoneMatch"
+      responses:
+        "200":
+          description: The product
+          headers:
+            ETag: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Product" }
+        "304": { description: Not modified }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    put:
+      tags: [catalog]
+      summary: Replace a product (optimistic locking)
+      description: >-
+        Requires `If-Match` (412 when stale) or a body `version` (409 when
+        stale). Orders already placed keep the price they were placed at.
+      security: [{ oauth2: [catalog:write] }]
+      parameters:
+        - $ref: "#/components/parameters/IfMatch"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/WriteProduct" }
+      responses:
+        "200":
+          description: Updated
+          headers:
+            ETag: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Product" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "412": { $ref: "#/components/responses/PreconditionFailed" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+
+  /v1/orders:
+    get:
+      tags: [orders]
+      summary: List the tenant's orders, newest first
+      security: [{ oauth2: [orders:read] }]
+      parameters:
+        - name: status
+          in: query
+          schema: { type: string, enum: [placed, cancelled] }
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: A page of orders (without lines)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OrderList" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+    post:
+      tags: [orders]
+      summary: Place an order
+      description: >-
+        Prices every line from the tenant's catalog (all products must be
+        active and share one currency), stores the order and emits an
+        `order.placed` event (Kafka topic `orderbook.events.order`) in the
+        same transaction.
+      security: [{ oauth2: [orders:write] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PlaceOrder" }
+      responses:
+        "201":
+          description: Placed
+          headers:
+            Location: { schema: { type: string } }
+            ETag: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Order" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "422":
+          description: >-
+            Validation failed (`validation_failed`) or a line is invalid
+            against the catalog (`unknown_product`, `inactive_product`,
+            `mixed_currencies`, `duplicate_product`; `errors.product_id`
+            names the product)
+          content:
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
+
+  /v1/orders/{id}:
+    parameters:
+      - $ref: "#/components/parameters/ID"
+    get:
+      tags: [orders]
+      summary: Get an order with its lines
+      security: [{ oauth2: [orders:read] }]
+      parameters:
+        - $ref: "#/components/parameters/IfNoneMatch"
+      responses:
+        "200":
+          description: The order
+          headers:
+            ETag: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Order" }
+        "304": { description: Not modified }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/orders/{id}/cancel:
+    parameters:
+      - $ref: "#/components/parameters/ID"
+    post:
+      tags: [orders]
+      summary: Cancel an order
+      description: Emits `order.cancelled`. With `If-Match`, only cancels that version.
+      security: [{ oauth2: [orders:write] }]
+      parameters:
+        - $ref: "#/components/parameters/IfMatch"
+      responses:
+        "200":
+          description: Cancelled
+          headers:
+            ETag: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Order" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "412": { $ref: "#/components/responses/PreconditionFailed" }
+
+  /v1/sales/daily:
+    get:
+      tags: [sales]
+      summary: Daily sales of the tenant
+      description: >-
+        Read model built by `api worker` from order events (eventually
+        consistent, typically under a second behind). Cancellations count
+        against the day the order was placed. Days are UTC.
+      security: [{ oauth2: [sales:read] }]
+      parameters:
+        - $ref: "#/components/parameters/From"
+        - $ref: "#/components/parameters/To"
+      responses:
+        "200":
+          description: One row per day and currency with activity
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  from: { type: string, format: date }
+                  to: { type: string, format: date }
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/DailySales" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+
+  /v1/platform/sales/top-tenants:
+    get:
+      tags: [platform]
+      summary: Tenants ranked by net sales (cross-tenant)
+      description: A multi-shard query that Citus runs in parallel on every shard.
+      security: [{ oauth2: [platform:read] }]
+      parameters:
+        - $ref: "#/components/parameters/From"
+        - $ref: "#/components/parameters/To"
+        - name: currency
+          in: query
+          schema: { type: string, minLength: 3, maxLength: 3, default: USD }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 10 }
+      responses:
+        "200":
+          description: Ranking
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  from: { type: string, format: date }
+                  to: { type: string, format: date }
+                  currency: { type: string }
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        tenant_id: { type: string }
+                        currency: { type: string }
+                        orders_placed: { type: integer }
+                        net_minor: { type: integer }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+
+components:
+  securitySchemes:
+    oauth2:
+      type: oauth2
+      description: >-
+        JWT access tokens validated against the issuer's JWKS. Tenant tokens
+        carry a `tenant_id` claim.
+      flows:
+        clientCredentials:
+          tokenUrl: http://localhost:8081/default/token
+          scopes: &scopes
+            catalog:read: Read products
+            catalog:write: Create and update products
+            orders:read: Read orders
+            orders:write: Place and cancel orders
+            sales:read: Read the tenant's sales reports
+            platform:read: Cross-tenant reports (operators)
+        authorizationCode:
+          authorizationUrl: http://localhost:8081/default/authorize
+          tokenUrl: http://localhost:8081/default/token
+          scopes: *scopes
+
+  parameters:
+    ID:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+    Cursor:
+      name: cursor
+      in: query
+      description: Opaque `next_cursor` from the previous page.
+      schema: { type: string }
+    IfMatch:
+      name: If-Match
+      in: header
+      description: Strong ETag (`"3"`) of the version you last read.
+      schema: { type: string }
+    IfNoneMatch:
+      name: If-None-Match
+      in: header
+      schema: { type: string }
+    From:
+      name: from
+      in: query
+      description: First day (UTC, inclusive). Defaults to 29 days before `to`.
+      schema: { type: string, format: date }
+    To:
+      name: to
+      in: query
+      description: Last day (UTC, inclusive). Defaults to today. Ranges are at most 366 days.
+      schema: { type: string, format: date }
+
+  schemas:
+    Product:
+      type: object
+      required: [id, sku, name, price_minor, currency, active, version, created_at, updated_at]
+      properties:
+        id: { type: string, format: uuid, description: UUIDv7 }
+        sku: { type: string, maxLength: 64, description: Unique per tenant }
+        name: { type: string, maxLength: 200 }
+        price_minor: { type: integer, minimum: 0, description: Price in the currency's minor unit (cents) }
+        currency: { type: string, example: USD }
+        active: { type: boolean }
+        version: { type: integer, minimum: 1 }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    ProductList:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: array
+          items: { $ref: "#/components/schemas/Product" }
+        next_cursor: { type: string, description: Present when more results exist. }
+    WriteProduct:
+      type: object
+      additionalProperties: false
+      required: [sku, name, price_minor, currency]
+      properties:
+        sku: { type: string, minLength: 1, maxLength: 64 }
+        name: { type: string, minLength: 1, maxLength: 200 }
+        price_minor: { type: integer, minimum: 0 }
+        currency: { type: string, minLength: 3, maxLength: 3, description: ISO 4217 code from the currencies reference table }
+        active: { type: boolean, default: true }
+        version:
+          type: integer
+          minimum: 1
+          description: PUT only, for clients that can't send `If-Match`.
+    Order:
+      type: object
+      required: [id, customer_ref, status, currency, total_minor, version, placed_at, updated_at]
+      properties:
+        id: { type: string, format: uuid }
+        customer_ref: { type: string }
+        status: { type: string, enum: [placed, cancelled] }
+        currency: { type: string }
+        total_minor: { type: integer }
+        version: { type: integer }
+        placed_at: { type: string, format: date-time }
+        cancelled_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        lines:
+          type: array
+          description: Present on single-order responses.
+          items:
+            type: object
+            properties:
+              line_no: { type: integer }
+              product_id: { type: string, format: uuid }
+              sku: { type: string }
+              name: { type: string }
+              quantity: { type: integer }
+              unit_price_minor: { type: integer }
+    OrderList:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: array
+          items: { $ref: "#/components/schemas/Order" }
+        next_cursor: { type: string }
+    PlaceOrder:
+      type: object
+      additionalProperties: false
+      required: [customer_ref, lines]
+      properties:
+        customer_ref: { type: string, minLength: 1, maxLength: 200 }
+        lines:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items:
+            type: object
+            additionalProperties: false
+            required: [product_id, quantity]
+            properties:
+              product_id: { type: string, format: uuid }
+              quantity: { type: integer, minimum: 1, maximum: 10000 }
+    DailySales:
+      type: object
+      properties:
+        day: { type: string, format: date }
+        currency: { type: string }
+        orders_placed: { type: integer }
+        orders_cancelled: { type: integer }
+        gross_minor: { type: integer }
+        cancelled_minor: { type: integer }
+        net_minor: { type: integer }
+    Health:
+      type: object
+      description: >-
+        The public port returns only `status`. Per-check results and build
+        info are served on the internal admin port only.
+      required: [status]
+      properties:
+        status: { type: string, enum: [ok, starting, unavailable, draining] }
+    Problem:
+      type: object
+      description: RFC 9457 problem details.
+      required: [type, title, status, code]
+      properties:
+        type: { type: string, example: about:blank }
+        title: { type: string, example: Not Found }
+        status: { type: integer, example: 404 }
+        detail: { type: string }
+        instance: { type: string, example: /v1/orders/0190... }
+        code:
+          type: string
+          description: Stable machine-readable error code.
+          example: order_not_found
+        request_id: { type: string }
+        errors:
+          type: object
+          description: Per-field validation messages.
+          additionalProperties: { type: string }
+
+  responses:
+    BadRequest:
+      description: Malformed request (`invalid_json`, `unknown_field`, `empty_body`, `invalid_if_match`, ...)
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    Unauthorized:
+      description: Missing, invalid or expired token
+      headers:
+        WWW-Authenticate: { schema: { type: string } }
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    Forbidden:
+      description: Token lacks a required scope, or carries no valid tenant (`tenant_required`, `tenant_invalid`)
+      headers:
+        WWW-Authenticate: { schema: { type: string } }
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    NotFound:
+      description: Resource not found (including resources of other tenants)
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    Conflict:
+      description: Conflict (`product_sku_taken`, `*_version_conflict`, `order_already_cancelled`)
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    PreconditionFailed:
+      description: The `If-Match` version is stale
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    ValidationFailed:
+      description: Field validation failed (`validation_failed`)
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    RateLimited:
+      description: Too many requests (`rate_limited`)
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }

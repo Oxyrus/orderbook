@@ -1,0 +1,271 @@
+# Local development stack.
+#
+#   docker compose up -d                          # Citus cluster + redis + mock OAuth2 + Kafka + Kafka Connect
+#   docker compose --profile observability up -d  # + prometheus, grafana, jaeger
+#   docker compose --profile app up -d --build    # + the API and the event worker in containers
+#
+# Topology (see docs/sharding.md and docs/cdc.md):
+#
+#   api ──SQL──▶ coordinator ──▶ worker1, worker2 (shards)
+#                                   │ WAL (logical decoding, one slot per worker)
+#                                   ▼
+#                 connect (Debezium, one connector per worker) ──▶ kafka ──▶ api worker
+name: orderbook
+
+x-citus: &citus
+  image: citusdata/citus:14.0-pg17
+  environment:
+    POSTGRES_USER: orderbook
+    POSTGRES_PASSWORD: orderbook
+    POSTGRES_DB: orderbook
+    PGUSER: orderbook
+    # The coordinator connects to the workers (and the workers to each other)
+    # without a password inside the compose network. Production clusters use
+    # passwords from .pgpass or certificates; see docs/sharding.md.
+    POSTGRES_HOST_AUTH_METHOD: trust
+  # wal_level=logical and citus.enable_change_data_capture are needed on
+  # every node for Debezium: shards (and so their WAL) live on the workers.
+  command:
+    - postgres
+    - -c
+    - wal_level=logical
+    - -c
+    - max_replication_slots=10
+    - -c
+    - max_wal_senders=10
+    - -c
+    - citus.enable_change_data_capture=on
+    # Never let an abandoned slot fill the disk (PostgreSQL 13+).
+    - -c
+    - max_slot_wal_keep_size=2GB
+  # Probe over TCP and require the extension: on first start the image runs
+  # its init scripts on a temporary socket-only server, which a plain
+  # `pg_isready` would already report as ready.
+  healthcheck:
+    test: ["CMD-SHELL", "psql -h 127.0.0.1 -U orderbook -d orderbook -tAc 'SELECT citus_version()' >/dev/null"]
+    interval: 3s
+    timeout: 5s
+    retries: 40
+    start_period: 10s
+
+services:
+  # The application connects to the coordinator only. It holds the metadata
+  # (which shard lives where) and routes or parallelises every query.
+  coordinator:
+    <<: *citus
+    ports: ["5432:5432"]
+    volumes:
+      - coordinator-data:/var/lib/postgresql/data
+
+  worker1:
+    <<: *citus
+    ports: ["5433:5432"]
+    volumes:
+      - worker1-data:/var/lib/postgresql/data
+
+  worker2:
+    <<: *citus
+    ports: ["5434:5432"]
+    volumes:
+      - worker2-data:/var/lib/postgresql/data
+
+  # One-shot job: register the coordinator and the workers in the Citus
+  # metadata. Idempotent, so it runs on every `up`.
+  cluster-init:
+    image: citusdata/citus:14.0-pg17
+    depends_on:
+      coordinator: { condition: service_healthy }
+      worker1: { condition: service_healthy }
+      worker2: { condition: service_healthy }
+    environment:
+      PGHOST: coordinator
+      PGUSER: orderbook
+      PGDATABASE: orderbook
+    volumes:
+      - ./deploy/citus/init-cluster.sql:/init-cluster.sql:ro
+    entrypoint: ["psql", "-v", "ON_ERROR_STOP=1", "-f", "/init-cluster.sql"]
+    restart: "no"
+
+  # Optional for the API (REDIS_ENABLED). See docs/redis.md.
+  redis:
+    image: redis:8-alpine
+    command: ["redis-server", "--maxmemory", "256mb", "--maxmemory-policy", "volatile-lru", "--save", "", "--appendonly", "no"]
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Local OAuth 2.0 / OIDC authorization server that issues real signed JWTs.
+  # The client id becomes the tenant: `make token client=acme`.
+  oauth2:
+    image: ghcr.io/navikt/mock-oauth2-server:6.1.4
+    ports: ["8081:8080"]
+    environment:
+      JSON_CONFIG_PATH: /config/config.json
+    volumes:
+      - ./deploy/mock-oauth2/config.json:/config/config.json:ro
+
+  # Single-node Kafka in KRaft mode (no ZooKeeper).
+  kafka:
+    image: apache/kafka:4.1.0
+    ports: ["29092:29092"]
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:29092
+      # Containers use kafka:9092; processes on the host use localhost:29092.
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 6
+      # Small heaps so the whole stack fits a 2-4 GB Docker VM.
+      KAFKA_HEAP_OPTS: -Xms256m -Xmx384m
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+
+  # One-shot job: create the application topics (partitions, retention,
+  # compaction) instead of relying on auto-creation. Idempotent.
+  kafka-init:
+    image: apache/kafka:4.1.0
+    depends_on:
+      kafka: { condition: service_healthy }
+    environment:
+      BOOTSTRAP: kafka:9092
+    volumes:
+      - ./deploy/kafka/create-topics.sh:/create-topics.sh:ro
+    entrypoint: ["bash", "/create-topics.sh"]
+    restart: "no"
+
+  # Kafka Connect with the Debezium connectors. Its REST API on :8083
+  # manages connectors (make cdc-status).
+  connect:
+    image: quay.io/debezium/connect:3.3
+    depends_on:
+      kafka-init: { condition: service_completed_successfully }
+    ports: ["8083:8083"]
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: orderbook-connect
+      CONFIG_STORAGE_TOPIC: _connect_configs
+      OFFSET_STORAGE_TOPIC: _connect_offsets
+      STATUS_STORAGE_TOPIC: _connect_statuses
+      CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      STATUS_STORAGE_REPLICATION_FACTOR: 1
+      HEAP_OPTS: -Xms256m -Xmx512m
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf localhost:8083/connectors >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+
+  # One-shot job (app profile): create/update the outbox connectors, one per
+  # worker, once the API has migrated the schema (the connectors need the
+  # orderbook_outbox publication). When running the API on the host, use
+  # `make cdc-register` after the first `make run` / `make migrate-up`.
+  connect-init:
+    profiles: ["app"]
+    image: quay.io/debezium/connect:3.3
+    depends_on:
+      connect: { condition: service_healthy }
+      api: { condition: service_healthy }
+    volumes:
+      - ./deploy/debezium:/debezium:ro
+    environment:
+      CONNECT_URL: http://connect:8083
+    entrypoint: ["bash", "/debezium/register.sh", "outbox"]
+    restart: "no"
+
+  api:
+    profiles: ["app"]
+    build:
+      context: .
+      args:
+        VERSION: compose
+    depends_on:
+      cluster-init: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+      oauth2: { condition: service_started }
+    ports: ["8080:8080", "9090:9090"]
+    environment: &app-env
+      APP_ENV: development
+      ADMIN_ENABLE_PPROF: "true"
+      LOG_FORMAT: json
+      LOG_LEVEL: debug
+      DB_URL: postgres://orderbook:orderbook@coordinator:5432/orderbook?sslmode=disable
+      DB_AUTO_MIGRATE: "true"
+      REDIS_ENABLED: "true"
+      REDIS_URL: redis://redis:6379/0
+      # Tokens are minted from the host (localhost:8081), so that is the
+      # issuer; keys are fetched over the compose network.
+      AUTH_ISSUER: http://localhost:8081/default
+      AUTH_JWKS_URL: http://oauth2:8080/default/jwks
+      AUTH_AUDIENCE: orderbook-api
+      KAFKA_BROKERS: kafka:9092
+      # Every request comes from the same host IP locally.
+      RATE_LIMIT_REQUESTS: "1000"
+      OTEL_TRACES_ENABLED: "true"
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+    restart: unless-stopped
+
+  # Consumes the order events Debezium publishes and maintains the
+  # tenant_daily_sales projection.
+  worker:
+    profiles: ["app"]
+    build:
+      context: .
+      args:
+        VERSION: compose
+    command: ["worker"]
+    depends_on:
+      api: { condition: service_healthy }
+      kafka-init: { condition: service_completed_successfully }
+    ports: ["9092:9090"]
+    environment:
+      <<: *app-env
+      SERVICE_NAME: orderbook-worker
+      DB_AUTO_MIGRATE: "false"
+    restart: unless-stopped
+
+  prometheus:
+    profiles: ["observability"]
+    image: prom/prometheus:v3.15.1
+    ports: ["9091:9090"]
+    volumes:
+      - ./deploy/prometheus:/etc/prometheus:ro
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+    extra_hosts: ["host.docker.internal:host-gateway"]
+
+  grafana:
+    profiles: ["observability"]
+    image: grafana/grafana:13.3.0
+    ports: ["3000:3000"]
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+
+  jaeger:
+    profiles: ["observability"]
+    image: jaegertracing/jaeger:2.22.0
+    ports:
+      - "16686:16686" # UI
+      - "4318:4318"   # OTLP/HTTP
+
+volumes:
+  coordinator-data:
+  worker1-data:
+  worker2-data:

@@ -1,0 +1,41 @@
+{
+  "interactiveLogin": true,
+  "httpServer": "NettyWrapper",
+  "tokenCallbacks": [
+    {
+      "issuerId": "default",
+      "tokenExpiry": 3600,
+      "requestMappings": [
+        {
+          "requestParam": "scope",
+          "match": "platform:read",
+          "claims": {
+            "sub": "${clientId}",
+            "aud": ["orderbook-api"],
+            "scope": "platform:read"
+          }
+        },
+        {
+          "requestParam": "scope",
+          "match": "catalog:read orders:read sales:read",
+          "claims": {
+            "sub": "${clientId}",
+            "aud": ["orderbook-api"],
+            "tenant_id": "${clientId}",
+            "scope": "catalog:read orders:read sales:read"
+          }
+        },
+        {
+          "requestParam": "grant_type",
+          "match": "*",
+          "claims": {
+            "sub": "${clientId}",
+            "aud": ["orderbook-api"],
+            "tenant_id": "${clientId}",
+            "scope": "catalog:read catalog:write orders:read orders:write sales:read"
+          }
+        }
+      ]
+    }
+  ]
+}

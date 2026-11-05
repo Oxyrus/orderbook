@@ -1,0 +1,45 @@
+# golangci-lint v2 configuration. https://golangci-lint.run/usage/configuration/
+version: "2"
+
+run:
+  timeout: 5m
+  build-tags: [integration]
+
+linters:
+  default: standard # errcheck, govet, ineffassign, staticcheck, unused
+  enable:
+    - bodyclose
+    - errorlint
+    - exhaustive
+    - gocritic
+    - gosec
+    - misspell
+    - nilerr
+    - noctx
+    - revive
+    - rowserrcheck
+    - sqlclosecheck
+    - unconvert
+    - usestdlibvars
+    - wastedassign
+  settings:
+    revive:
+      rules:
+        - name: exported
+          disabled: true # constructors such as httpx.BadRequest are self-explanatory
+        - name: package-comments
+    exhaustive:
+      default-signifies-exhaustive: true
+  exclusions:
+    presets: [comments, std-error-handling]
+    rules:
+      - path: _test\.go
+        linters: [gosec, noctx, bodyclose]
+      - path: internal/testutil/
+        linters: [gosec]
+
+formatters:
+  enable: [gofmt, goimports]
+  settings:
+    goimports:
+      local-prefixes: [github.com/Oxyrus/orderbook]
